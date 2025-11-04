@@ -20,7 +20,7 @@
 #include "wifi_remote.h"
 
 // Constants
-static char const TAG[] = "main";
+//static char const TAG[] = "main";
 
 // Global variables
 static size_t                       display_h_res        = 0;
