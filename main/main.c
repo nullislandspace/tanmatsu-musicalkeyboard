@@ -55,7 +55,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(bsp_device_initialize());
 
     uint8_t led_data[] = {
-        0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0xFF,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     };
     bsp_led_write(led_data, sizeof(led_data));
 
@@ -122,62 +122,28 @@ void app_main(void) {
     // Get input event queue from BSP
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
-    // Start WiFi stack (if your app does not require WiFi or BLE you can remove this section)
-    pax_background(&fb, WHITE);
-    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Connecting to radio...");
-    blit();
-
-    /*
-    if (wifi_remote_initialize() == ESP_OK) {
-
-        pax_background(&fb, WHITE);
-        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Starting WiFi stack...");
-        blit();
-        wifi_connection_init_stack();  // Start the Espressif WiFi stack
-
-        pax_background(&fb, WHITE);
-        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Connecting to WiFi network...");
-        blit();
-
-        if (wifi_connect_try_all() == ESP_OK) {
-            pax_background(&fb, WHITE);
-            pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Succesfully connected to WiFi network");
-            blit();
-        } else {
-            pax_background(&fb, RED);
-            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Failed to connect to WiFi network");
-            blit();
-        }
-    } else {
-        bsp_power_set_radio_state(BSP_POWER_RADIO_STATE_OFF);
-        ESP_LOGE(TAG, "WiFi radio not responding, WiFi not available");
-        pax_background(&fb, RED);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "WiFi unavailable");
-        blit();
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(500));
-    */
-
     // Main section of the app
 
-    // This example shows how to read from the BSP event queue to read input events
+    // Bounce some balls around the screen
+    //
+    // On every bounce, light up one LED with the specific ball color, also blink the keyboard
 
-    // If you want to run something at an interval in this same main thread you can replace portMAX_DELAY with an amount
-    // of ticks to wait, for example pdMS_TO_TICKS(1000)
 
-    pax_background(&fb, WHITE);
-    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Welcome! Press any key to trigger an event.");
-    blit();
+    // Setup data for the balls, "physics" and the corresponding LEDs
+    int32_t xoffs[5] = {100, 130, 170, 230, 335}; // Starting X position of balls
+    int32_t yoffs[5] = {100, 107, 209, 305, 227}; // Starting Y position of balls
+    int32_t xspeed[5] = {2, 1, -1, 3, -2}; // X speed (delta) of balls
+    int32_t yspeed[5] = {1, -1, 2, -2, 3}; // Y speed (delta) of balls
+    uint32_t color[5] = {0xFFFF0000, 0xFF00FF00, 0xFFFF00FF, 0xFF00FFFF, 0xFFFFFF00}; // Ball colors
+    bool bounce[5] = {false, false, false, false, false}; // Has bounced this render cycle
 
-    int32_t xoffs[5] = {100, 130, 170, 230, 335};
-    int32_t yoffs[5] = {100, 107, 209, 305, 227};;
-    int32_t xspeed[5] = {2, 1, -1, 3, -2};
-    int32_t yspeed[5] = {1, -1, 2, -2, 3};
-    uint32_t color[5] = {0xFFFF0000, 0xFF00FF00, 0xFFFF00FF, 0xFF00FFFF, 0xFFFFFF00};
-    bool bounce[5] = {false, false, false, false, false};
+    uint8_t led_offs[5] = {0 * 3, 1 * 3, 2 * 3, 4 * 3, 5 * 3};  // Starting offset in the led_data for the corresponding balls
+    uint8_t led_colormap[15] = {0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00}; // Color of the balls, split into bytes
+
+
     uint8_t i;
-    uint32_t delay = pdMS_TO_TICKS(1);
+    uint8_t ledoffs;
+    uint32_t delay = 0; //pdMS_TO_TICKS(1);
     uint8_t bright = 100;
     while(1) {
         bsp_input_event_t event;
@@ -185,6 +151,11 @@ void app_main(void) {
             bsp_device_restart_to_launcher();
         }
         pax_background(&fb, BLACK);
+        //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Press any key to exit the demo.");
+
+        memset(led_data, 0, 18); // LEDS OFF
+        led_data[(3 * 3) + 0] = 0xFF; // Power LED on
+        led_data[(3 * 3) + 1] = 0xFF;
 
         for(i = 0; i < 5; i++) {
             bounce[i] = false;
@@ -207,6 +178,13 @@ void app_main(void) {
             if(bounce[i]) {
                 pax_draw_circle(&fb, BLACK, yoffs[i] + 25, xoffs[i] + 25, 15);
                 pax_draw_circle(&fb, WHITE, yoffs[i] + 25, xoffs[i] + 25, 10);
+                
+                ledoffs = led_offs[i];
+
+                // For some strange reason, the LED array seems to expect G R B (instead of R G B), so we swap the bytes accordingly
+                led_data[ledoffs + 0] = led_colormap[(i * 3) + 1];
+                led_data[ledoffs + 1] = led_colormap[(i * 3) + 0];
+                led_data[ledoffs + 2] = led_colormap[(i * 3) + 2];
             }
         }
         bsp_input_set_backlight_brightness(bright);
@@ -214,5 +192,6 @@ void app_main(void) {
             bright -= 25;
         }
         blit();
+        bsp_led_write(led_data, sizeof(led_data));
     }
 }
