@@ -137,11 +137,116 @@ All components compiled successfully with no errors.
 
 ## Testing Notes
 
-The implementation is ready for hardware testing. Expected behavior:
-1. Each ball should play a different tone when bouncing (pentatonic scale)
-2. Multiple balls can bounce simultaneously with sounds mixing
-3. Animation should remain smooth (no pausing)
-4. LEDs and keyboard backlight should still work as before
+**Hardware Testing: ✅ COMPLETED AND VERIFIED**
+
+The implementation has been tested on actual Tanmatsu hardware and confirmed working:
+1. ✅ Each ball plays a different tone when bouncing (pentatonic scale)
+2. ✅ Multiple balls can bounce simultaneously with sounds mixing cleanly
+3. ✅ Animation remains smooth (no pausing or stuttering)
+4. ✅ LEDs and keyboard backlight continue working as expected
+
+**Status: FULLY FUNCTIONAL**
+
+---
+
+## MOD Player Integration (Background Music)
+
+### Phase 1: Research and Planning
+- [x] Analyze original modplayer.c from /home/cavac/src/modtracker/
+- [x] Understand MOD file format and playback engine
+- [x] Design integration strategy with existing I2S audio system
+- [x] Choose ring buffer architecture for audio mixing
+
+### Phase 2: File Conversion and Headers
+- [x] Convert popcorn_remix.mod (60KB) to C header using xxd
+- [x] Create modplayer_esp32.h interface
+- [x] Create modplayer_esp32.c adapted from modplayer.c
+
+### Phase 3: Integration
+- [x] Add ring buffer (2048 samples) for MOD output
+- [x] Modify audio_task to mix MOD background with bounce sounds
+- [x] Initialize MOD player and create playback task
+- [x] Update CMakeLists.txt to include modplayer in build
+
+### Phase 4: Build and Test
+- [x] Build successful! Binary size: 586 KB (44% partition free)
+- [ ] Hardware testing (pending user verification)
+
+### Implementation Details
+
+**MOD Player Architecture:**
+- **Separate FreeRTOS task** on Core 1 (lower priority than audio task)
+- **Ring buffer** (2048 int16_t samples) for MOD→audio communication
+- **4-channel Amiga MOD** playback with full effect support
+- **30% volume scaling** for background music
+- **Continuous looping** playback
+
+**File Details:**
+- **popcorn_remix.mod** - 60KB, 4-channel MOD by xain l.k (Oct 1990)
+- Embedded directly in flash (no file I/O needed)
+- Parsed once at startup, patterns allocated dynamically
+
+**Audio Mixing Flow:**
+```
+1. MOD task → generates samples → writes to ring buffer
+2. Audio task → reads MOD samples (30%) + bounce sounds (70%)
+3. Soft clipping and stereo conversion
+4. I2S output
+```
+
+**Memory Usage:**
+- Flash: +60KB for MOD data, +~7KB for code
+- RAM: +8KB ring buffer, +~15KB for MOD structures
+- Total increase: ~67KB (acceptable for ESP32)
+
+**Technical Specs:**
+- Sample rate: 44,100 Hz (matches I2S)
+- Format: Mono MOD output duplicated to stereo
+- Ring buffer: 2048 samples (~46ms latency)
+- MOD task priority: configMAX_PRIORITIES - 3
+- Audio task priority: configMAX_PRIORITIES - 2
+
+### Files Created/Modified for MOD Player
+
+1. **main/popcorn_remix_mod.h** (241KB) - Embedded MOD file data
+2. **main/modplayer_esp32.h** - MOD player interface
+3. **main/modplayer_esp32.c** - Adapted MOD playback engine
+4. **main/main.c** - Integrated MOD mixing into audio_task
+5. **main/CMakeLists.txt** - Added modplayer_esp32.c to build
+
+### Key Adaptations from Original modplayer.c
+
+**Removed:**
+- All ALSA audio output code
+- File I/O (fopen, fread, etc.)
+- Terminal visualization and user interaction
+- malloc for sample data (now points to flash)
+
+**Added:**
+- FreeRTOS task-based playback
+- Ring buffer output for integration
+- ESP32 heap allocation for patterns
+- Continuous looping functionality
+- Volume scaling (30%) for background music
+- ESP-IDF logging
+
+**Preserved:**
+- Complete MOD format parsing
+- 4-channel mixing engine
+- Sample playback with looping
+- Effect processing (volume, speed, tempo, pattern break)
+- Amiga period-to-frequency conversion
+
+### Build Results
+
+**Before MOD Player:**
+- Binary size: 0x7edc0 (519 KB)
+- Free space: 0x81240 (520 KB, 50%)
+
+**After MOD Player:**
+- Binary size: 0x8e750 (586 KB)
+- Free space: 0x718b0 (465 KB, 44%)
+- Increase: +67 KB
 
 ## Future Enhancements
 

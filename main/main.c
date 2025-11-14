@@ -25,6 +25,7 @@
 #include "wifi_connection.h"
 #include "wifi_remote.h"
 #include "bounce_sounds.h"
+#include "modplayer_esp32.h"
 
 // Constants
 //static char const TAG[] = "main";
@@ -80,7 +81,7 @@ void audio_task(void* arg) {
                         active_sounds[slot].sample_data = bounce_samples[i];
                         active_sounds[slot].sample_length = bounce_lengths[i];
                         active_sounds[slot].playback_position = 0;
-                        active_sounds[slot].volume = 0.7f;  // 70% volume to allow headroom
+                        active_sounds[slot].volume = 0.1f;  // 10% volume for ball sounds
                         active_sounds[slot].active = true;
                         break;
                     }
@@ -93,6 +94,15 @@ void audio_task(void* arg) {
         for (int frame = 0; frame < FRAMES_PER_WRITE; frame++) {
             float mix_left = 0.0f;
             float mix_right = 0.0f;
+
+            // Add MOD background music (if available)
+            if (mod_read_pos != mod_write_pos) {
+                int16_t mod_sample = mod_ring_buffer[mod_read_pos];
+                float mod_sample_f = mod_sample / 32768.0f;
+                mix_left += mod_sample_f;
+                mix_right += mod_sample_f;
+                mod_read_pos = (mod_read_pos + 1) % MOD_BUFFER_SIZE;
+            }
 
             // Accumulate all active sounds
             for (int i = 0; i < MAX_ACTIVE_SOUNDS; i++) {
@@ -163,6 +173,9 @@ void app_main(void) {
     // Initialize active sounds array
     memset(active_sounds, 0, sizeof(active_sounds));
 
+    // Initialize MOD player
+    modplayer_init();
+
     // Create audio mixing task on Core 1 with high priority
     xTaskCreatePinnedToCore(
         audio_task,
@@ -170,6 +183,17 @@ void app_main(void) {
         4096,                           // Stack size
         NULL,                           // Parameters
         configMAX_PRIORITIES - 2,       // High priority
+        NULL,                           // Task handle
+        1                               // Pin to Core 1
+    );
+
+    // Create MOD player task on Core 1 with lower priority
+    xTaskCreatePinnedToCore(
+        modplayer_task,
+        "modplayer",
+        8192,                           // Stack size (larger for MOD processing)
+        NULL,                           // Parameters
+        configMAX_PRIORITIES - 3,       // Lower priority than audio task
         NULL,                           // Task handle
         1                               // Pin to Core 1
     );
@@ -265,7 +289,7 @@ void app_main(void) {
 
     uint8_t i;
     uint8_t ledoffs;
-    uint32_t delay = 0; //pdMS_TO_TICKS(1);
+    uint32_t delay = pdMS_TO_TICKS(1);  // 1ms timeout for responsive input
     uint8_t bright = 100;
     while(1) {
         bsp_input_event_t event;
