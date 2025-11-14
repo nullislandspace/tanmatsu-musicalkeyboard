@@ -21,7 +21,7 @@ static const char *TAG = "MOD";
 #define NUM_CHANNELS       4
 #define ROWS_PER_PATTERN   64
 #define BYTES_PER_NOTE     4
-#define SAMPLE_RATE        44100
+#define SAMPLE_RATE        22050  // MOD playback rate (half of I2S output rate)
 #define PROCESS_BUFFER_SIZE 1024
 #define BASE_TEMPO         125  // Default MOD tempo in BPM
 #define MOD_VOLUME_SCALE   0.7f // Background music at 70% volume
@@ -195,20 +195,26 @@ static void free_mod_file(MODFile *mod) {
 }
 
 // Write to ring buffer (thread-safe)
+// Upsamples from 22050 Hz to 44100 Hz by duplicating each sample
 static void write_to_ring_buffer(int16_t *samples, size_t count) {
     for (size_t i = 0; i < count; i++) {
-        // Calculate next write position
-        uint32_t next_pos = (mod_write_pos + 1) % MOD_BUFFER_SIZE;
+        int16_t scaled_sample = (int16_t)(samples[i] * MOD_VOLUME_SCALE);
 
-        // Check for buffer overflow (don't overwrite unread data)
-        if (next_pos == mod_read_pos) {
-            // Buffer full, skip this sample (underrun will handle it)
-            continue;
+        // Write sample twice to upsample from 22050 to 44100 Hz
+        for (int j = 0; j < 2; j++) {
+            // Calculate next write position
+            uint32_t next_pos = (mod_write_pos + 1) % MOD_BUFFER_SIZE;
+
+            // Check for buffer overflow (don't overwrite unread data)
+            if (next_pos == mod_read_pos) {
+                // Buffer full, skip this sample
+                continue;
+            }
+
+            // Write upsampled data
+            mod_ring_buffer[mod_write_pos] = scaled_sample;
+            mod_write_pos = next_pos;
         }
-
-        // Apply volume scaling and write
-        mod_ring_buffer[mod_write_pos] = (int16_t)(samples[i] * MOD_VOLUME_SCALE);
-        mod_write_pos = next_pos;
     }
 }
 
@@ -308,6 +314,13 @@ static void process_row(MODFile *mod, ChannelState *channels, int position, int 
     }
 }
 
+// Calculate samples per tick based on tempo
+static int calculate_tick_samples(int tempo) {
+    // 2500 / tempo = milliseconds per tick
+    // (ms * sample_rate) / 1000 = samples per tick
+    return (2500 * SAMPLE_RATE) / (tempo * 1000);
+}
+
 // MOD player task
 void modplayer_task(void* arg) {
     MODFile mod = {0};
@@ -329,6 +342,7 @@ void modplayer_task(void* arg) {
     int ticks_per_row = 5; // Default speed
     int current_tick = 0;
     int tempo = 125; // Default tempo (BPM)
+    int samples_per_tick = calculate_tick_samples(tempo);
 
     ESP_LOGI(TAG, "Starting MOD playback");
 
@@ -351,13 +365,16 @@ void modplayer_task(void* arg) {
                 } else if (channels[c].effect == 0xF && channels[c].param >= 0x20) {
                     // Set tempo (BPM)
                     tempo = channels[c].param;
+                    samples_per_tick = calculate_tick_samples(tempo);
                 }
             }
         }
 
         // Process and output audio for this tick
-        process_tick(&mod, channels, buffer, PROCESS_BUFFER_SIZE);
-        write_to_ring_buffer(buffer, PROCESS_BUFFER_SIZE);
+        // Generate the correct number of samples based on tempo
+        int samples_to_generate = (samples_per_tick < PROCESS_BUFFER_SIZE) ? samples_per_tick : PROCESS_BUFFER_SIZE;
+        process_tick(&mod, channels, buffer, samples_to_generate);
+        write_to_ring_buffer(buffer, samples_to_generate);
 
         // Update tick counter
         current_tick++;
@@ -377,10 +394,12 @@ void modplayer_task(void* arg) {
             }
         }
 
-        // Delay based on sample generation timing
-        // At 44.1kHz, 1024 samples = 23.2ms playback time
-        // Use 20ms to stay slightly ahead of consumption
-        vTaskDelay(pdMS_TO_TICKS(20));
+        // Delay based on actual samples generated
+        // Calculate milliseconds for the samples we just generated
+        int delay_ms = (samples_to_generate * 1000) / SAMPLE_RATE;
+        if (delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        }
     }
 
     // Cleanup
