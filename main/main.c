@@ -1,15 +1,21 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+#include <math.h>
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
 #include "bsp/led.h"
 #include "bsp/power.h"
+#include "bsp/audio.h"
 #include "custom_certificates.h"
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "hal/lcd_types.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
@@ -18,9 +24,27 @@
 #include "portmacro.h"
 #include "wifi_connection.h"
 #include "wifi_remote.h"
+#include "bounce_sounds.h"
 
 // Constants
 //static char const TAG[] = "main";
+
+// External BSP audio function (not in public header)
+extern void bsp_audio_initialize(uint32_t rate);
+
+// Audio constants
+#define MAX_ACTIVE_SOUNDS 5
+#define FRAMES_PER_WRITE  64
+#define SAMPLE_RATE       44100
+
+// Audio data structures
+typedef struct {
+    const int16_t* sample_data;    // Pointer to sound sample in flash
+    uint32_t sample_length;        // Total samples in sound
+    uint32_t playback_position;    // Current playback position
+    bool active;                   // Is this sound currently playing?
+    float volume;                  // Volume 0.0 to 1.0
+} active_sound_t;
 
 // Global variables
 static size_t                       display_h_res        = 0;
@@ -30,10 +54,86 @@ static lcd_rgb_data_endian_t        display_data_endian  = LCD_RGB_DATA_ENDIAN_L
 static pax_buf_t                    fb                   = {0};
 static QueueHandle_t                input_event_queue    = NULL;
 
+// Audio global variables
+static i2s_chan_handle_t i2s_handle = NULL;
+static active_sound_t active_sounds[MAX_ACTIVE_SOUNDS];
+static volatile bool sound_trigger[5] = {false, false, false, false, false};
+
 #if defined(CONFIG_BSP_TARGET_KAMI)
 // Temporary addition for supporting epaper devices (irrelevant for Tanmatsu)
 static pax_col_t palette[] = {0xffffffff, 0xff000000, 0xffff0000};  // white, black, red
 #endif
+
+// Audio mixing task
+void audio_task(void* arg) {
+    int16_t output_buffer[FRAMES_PER_WRITE * 2];  // Stereo: 2 channels per frame
+    size_t bytes_written;
+
+    while (1) {
+        // 1. Check for new sound triggers from main loop
+        for (int i = 0; i < 5; i++) {
+            if (sound_trigger[i]) {
+                // Find a free slot or reuse the slot for this sound
+                for (int slot = 0; slot < MAX_ACTIVE_SOUNDS; slot++) {
+                    if (!active_sounds[slot].active ||
+                        active_sounds[slot].sample_data == bounce_samples[i]) {
+                        active_sounds[slot].sample_data = bounce_samples[i];
+                        active_sounds[slot].sample_length = bounce_lengths[i];
+                        active_sounds[slot].playback_position = 0;
+                        active_sounds[slot].volume = 0.7f;  // 70% volume to allow headroom
+                        active_sounds[slot].active = true;
+                        break;
+                    }
+                }
+                sound_trigger[i] = false;  // Clear the trigger
+            }
+        }
+
+        // 2. Mix all active sounds into output buffer
+        for (int frame = 0; frame < FRAMES_PER_WRITE; frame++) {
+            float mix_left = 0.0f;
+            float mix_right = 0.0f;
+
+            // Accumulate all active sounds
+            for (int i = 0; i < MAX_ACTIVE_SOUNDS; i++) {
+                if (active_sounds[i].active) {
+                    // Get sample value
+                    int16_t sample = active_sounds[i].sample_data[
+                        active_sounds[i].playback_position
+                    ];
+
+                    // Convert to float (-1.0 to 1.0) and apply volume
+                    float sample_f = (sample / 32768.0f) * active_sounds[i].volume;
+
+                    // Accumulate (mono to stereo)
+                    mix_left += sample_f;
+                    mix_right += sample_f;
+
+                    // Advance playback position
+                    active_sounds[i].playback_position++;
+                    if (active_sounds[i].playback_position >=
+                        active_sounds[i].sample_length) {
+                        active_sounds[i].active = false;  // Sound finished
+                    }
+                }
+            }
+
+            // Soft clip to prevent distortion
+            mix_left = fminf(1.0f, fmaxf(-1.0f, mix_left));
+            mix_right = fminf(1.0f, fmaxf(-1.0f, mix_right));
+
+            // Convert back to 16-bit stereo
+            output_buffer[frame * 2] = (int16_t)(mix_left * 32767.0f);
+            output_buffer[frame * 2 + 1] = (int16_t)(mix_right * 32767.0f);
+        }
+
+        // 3. Write to I2S (blocks until DMA buffer is ready, ~1.45ms)
+        if (i2s_handle != NULL) {
+            i2s_channel_write(i2s_handle, output_buffer,
+                            sizeof(output_buffer), &bytes_written, portMAX_DELAY);
+        }
+    }
+}
 
 void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
@@ -53,6 +153,26 @@ void app_main(void) {
 
     // Initialize the Board Support Package
     ESP_ERROR_CHECK(bsp_device_initialize());
+
+    // Initialize audio subsystem
+    bsp_audio_initialize(SAMPLE_RATE);
+    bsp_audio_get_i2s_handle(&i2s_handle);
+    bsp_audio_set_amplifier(true);   // Enable amplifier
+    bsp_audio_set_volume(100);       // Set master volume to maximum
+
+    // Initialize active sounds array
+    memset(active_sounds, 0, sizeof(active_sounds));
+
+    // Create audio mixing task on Core 1 with high priority
+    xTaskCreatePinnedToCore(
+        audio_task,
+        "audio",
+        4096,                           // Stack size
+        NULL,                           // Parameters
+        configMAX_PRIORITIES - 2,       // High priority
+        NULL,                           // Task handle
+        1                               // Pin to Core 1
+    );
 
     uint8_t led_data[] = {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -140,6 +260,8 @@ void app_main(void) {
     uint8_t led_offs[5] = {0 * 3, 1 * 3, 2 * 3, 4 * 3, 5 * 3};  // Starting offset in the led_data for the corresponding balls
     uint8_t led_colormap[15] = {0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00}; // Color of the balls, split into bytes
 
+    // Bounce sound frequencies: 440, 554, 659, 784, 880 Hz (pentatonic scale)
+    // Sound samples are pre-generated and loaded from bounce_sounds.h
 
     uint8_t i;
     uint8_t ledoffs;
@@ -178,8 +300,11 @@ void app_main(void) {
             if(bounce[i]) {
                 pax_draw_circle(&fb, BLACK, yoffs[i] + 25, xoffs[i] + 25, 15);
                 pax_draw_circle(&fb, WHITE, yoffs[i] + 25, xoffs[i] + 25, 10);
-                
+
                 ledoffs = led_offs[i];
+
+                // Trigger bounce sound for this ball
+                sound_trigger[i] = true;
 
                 // For some strange reason, the LED array seems to expect G R B (instead of R G B), so we swap the bytes accordingly
                 led_data[ledoffs + 0] = led_colormap[(i * 3) + 1];
