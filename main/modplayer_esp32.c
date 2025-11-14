@@ -235,7 +235,7 @@ static void process_tick(MODFile *mod, ChannelState *channels, int16_t *buffer, 
                     if (pos < mod->samples[sample_idx].length) {
                         // Apply volume and mix
                         int sample_val = mod->samples[sample_idx].data[pos];
-                        mixed += ((sample_val * channels[c].volume) / 64) * 4; // 4x gain
+                        mixed += ((sample_val * channels[c].volume) / 64) * 32; // 32x gain for louder output
 
                         // Update position
                         channels[c].sample_pos += channels[c].sample_increment;
