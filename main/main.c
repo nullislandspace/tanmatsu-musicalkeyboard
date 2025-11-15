@@ -26,6 +26,7 @@
 #include "wifi_remote.h"
 #include "bounce_sounds.h"
 #include "modplayer_esp32.h"
+#include "logo_image.h"
 
 // Constants
 //static char const TAG[] = "main";
@@ -53,6 +54,7 @@ static size_t                       display_v_res        = 0;
 static lcd_color_rgb_pixel_format_t display_color_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
 static lcd_rgb_data_endian_t        display_data_endian  = LCD_RGB_DATA_ENDIAN_LITTLE;
 static pax_buf_t                    fb                   = {0};
+static pax_buf_t                    logo_buf             = {0};  // Logo image buffer
 static QueueHandle_t                input_event_queue    = NULL;
 
 // Audio global variables
@@ -253,6 +255,10 @@ void app_main(void) {
 #endif
     pax_buf_set_orientation(&fb, orientation);
 
+    // Initialize logo buffer with same orientation as framebuffer
+    pax_buf_init(&logo_buf, (void*)logo_image_data, LOGO_WIDTH, LOGO_HEIGHT, PAX_BUF_16_565RGB);
+    pax_buf_set_orientation(&logo_buf, orientation);
+
 #if defined(CONFIG_BSP_TARGET_KAMI)
 #define BLACK 0
 #define WHITE 1
@@ -296,7 +302,14 @@ void app_main(void) {
         if (xQueueReceive(input_event_queue, &event, delay) == pdTRUE) {
             bsp_device_restart_to_launcher();
         }
+        // Draw black background
         pax_background(&fb, BLACK);
+        // Draw centered logo using actual hardware dimensions
+        // (logo is unrotated, fb coordinates account for rotation via pax_buf_get_*)
+        int fb_w = pax_buf_get_width(&fb);
+        int fb_h = pax_buf_get_height(&fb);
+        //pax_draw_image_op(&fb, &logo_buf, (fb_w - LOGO_WIDTH) / 2, (fb_h - LOGO_HEIGHT) / 2);
+        pax_draw_image_op(&fb, &logo_buf, 200, -100);
         //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Press any key to exit the demo.");
 
         memset(led_data, 0, 18); // LEDS OFF
