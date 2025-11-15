@@ -1,8 +1,8 @@
-# Tanmatsu "Ballz demo" project
+# Tanmatsu project for testing new demoscene stuff (faster graphics etc)
 
-This minimal demo shows how to build an app for Tanmatsu using the [PAX graphics](https://github.com/robotman2412/pax-graphics/tree/release/1.1.1/docs) library.
+It is based on the [Template app](https://github.com/Nicolai-Electronics/tanmatsu-template) and the [Ballz demo](https://github.com/cavac/tanmatsu-ballz)
 
-It is based in the [Template app](https://github.com/Nicolai-Electronics/tanmatsu-template)
+This isn't a demo itself, but will test stuff to make better, cooler demos ;-)
 
 For more information visit the [documentation website](https://docs.tanmatsu.cloud).
 
