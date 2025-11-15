@@ -170,7 +170,7 @@ The implementation has been tested on actual Tanmatsu hardware and confirmed wor
 
 ### Phase 4: Build and Test
 - [x] Build successful! Binary size: 586 KB (44% partition free)
-- [ ] Hardware testing (pending user verification)
+- [x] Hardware testing - initial issues found and fixed
 
 ### Implementation Details
 
@@ -248,6 +248,89 @@ The implementation has been tested on actual Tanmatsu hardware and confirmed wor
 - Free space: 0x718b0 (465 KB, 44%)
 - Increase: +67 KB
 
+### Issues and Fixes
+
+#### Issue 1: Audio Clicking/Buzzing Instead of Music
+**Problem:** MOD playback sounded like low clicking/buzzing noise instead of music.
+**Root Cause:** MOD task delay was 1ms but generated 1024 samples (~23ms at 44.1kHz), causing ring buffer overflow and sample dropping.
+**Solution:** Changed vTaskDelay from 1ms to 20ms in modplayer_esp32.c:383.
+**Result:** ✅ Music played correctly.
+
+#### Issue 2: Keyboard Input Not Working
+**Problem:** Cannot exit program using keyboard after MOD integration.
+**Root Cause:** Input queue timeout was set to 0 (non-blocking), main loop spinning too fast.
+**Solution:** Changed delay from 0 to pdMS_TO_TICKS(1) in main.c:292 (1ms timeout for responsive input).
+**Result:** ✅ Keyboard handling restored.
+
+#### Issue 3: Background Music Too Quiet
+**Problem:** MOD music volume very low compared to bounce sounds.
+**Root Cause:** 8-bit MOD samples (-128 to 127) inherently quieter than 16-bit, only had 4x gain.
+**Solution:** Increased internal gain from 4x to 32x in modplayer_esp32.c:244.
+**Result:** ✅ Music audible at appropriate volume.
+
+#### Issue 4: Music Playing 2x Too Fast
+**Problem:** Music tempo approximately twice as fast as it should be.
+**Root Cause:** Generated fixed 1024 samples per tick instead of calculating correct samples based on tempo (should be 882 at 125 BPM).
+**Solution:**
+- Added `calculate_tick_samples()` function using formula: `(2500 × sample_rate) / (tempo × 1000)`
+- Modified tick processing to generate correct number of samples based on current tempo
+- Fixed delay calculation to match actual samples generated
+**Result:** ✅ Tempo corrected to proper speed.
+
+#### Issue 5: Speed and Pitch Both Too High
+**Problem:** Music still too fast and pitch too high after tempo fix.
+**Root Cause:** MOD playback rate at 44100 Hz was too high. Original Amiga MODs typically play at lower sample rates (8363-22050 Hz).
+**Solution:**
+- Changed SAMPLE_RATE from 44100 to 22050 in modplayer_esp32.c:24
+- Implemented 2x upsampling in write_to_ring_buffer() - duplicate each sample
+- This maintains correct pitch and tempo while outputting at 44100 Hz for I2S
+**Changes:**
+```c
+#define SAMPLE_RATE        22050  // MOD playback rate (half of I2S output rate)
+
+static void write_to_ring_buffer(int16_t *samples, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int16_t scaled_sample = (int16_t)(samples[i] * MOD_VOLUME_SCALE);
+        // Write sample twice to upsample from 22050 to 44100 Hz
+        for (int j = 0; j < 2; j++) {
+            uint32_t next_pos = (mod_write_pos + 1) % MOD_BUFFER_SIZE;
+            if (next_pos == mod_read_pos) continue;
+            mod_ring_buffer[mod_write_pos] = scaled_sample;
+            mod_write_pos = next_pos;
+        }
+    }
+}
+```
+**Result:** ✅ Correct tempo and pitch (pending user verification).
+
+### Volume Balance Adjustments
+**User Request:** 70% background music, 10% ball sounds.
+**Implementation:**
+- MOD_VOLUME_SCALE = 0.7f in modplayer_esp32.c:27
+- Ball sound volume = 0.1f in main.c:84
+**Result:** ✅ Proper volume balance.
+
+### Final Technical Specifications
+
+**MOD Playback:**
+- Internal sample rate: 22,050 Hz (matches Amiga MOD standards)
+- Output sample rate: 44,100 Hz (2x upsampling)
+- Volume: 70% of maximum
+- Internal gain: 32x (compensates for 8-bit samples)
+- Format: Mono upsampled to stereo
+- Tempo calculation: `(2500 × 22050) / (tempo × 1000)` samples per tick
+  - At 125 BPM: 441 samples per tick at 22.05kHz (882 after upsampling)
+
+**Ball Sounds:**
+- Volume: 10% of maximum
+- Sample rate: 44,100 Hz native
+- Format: Mono duplicated to stereo
+
+**Audio Mixing:**
+- Float accumulation prevents overflow
+- Soft clipping prevents distortion
+- MOD + ball sounds mixed in audio_task before I2S output
+
 ## Future Enhancements
 
 Possible improvements for future iterations:
@@ -256,3 +339,5 @@ Possible improvements for future iterations:
 3. Add volume fade-out for smoother sound endings
 4. Support for additional sound effects (whoosh, collision, etc.)
 5. Dynamic frequency adjustment based on collision energy
+6. Support for multiple MOD files or playlist functionality
+7. Add MOD file selection via user input

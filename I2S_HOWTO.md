@@ -467,6 +467,267 @@ if (elapsed > 1450) {  // Buffer duration in microseconds
 - **Tanmatsu BSP:** `managed_components/badgeteam__badge-bsp/`
 - **Example Implementation:** tanmatsu-ballz project (this project)
 
+## MOD Music Playback Integration
+
+### Overview
+
+Adding background music via MOD (Module) files requires a separate playback engine that outputs to a ring buffer, which the audio task then mixes with sound effects.
+
+### Ring Buffer Architecture
+
+**Why a ring buffer?**
+- Decouples MOD playback rate from I2S output rate
+- Allows independent task priorities (MOD lower, audio higher)
+- Provides buffering for smooth playback during CPU spikes
+
+**Implementation:**
+
+```c
+#define MOD_BUFFER_SIZE 2048
+
+// Global ring buffer
+int16_t mod_ring_buffer[MOD_BUFFER_SIZE];
+volatile uint32_t mod_write_pos = 0;
+volatile uint32_t mod_read_pos = 0;
+
+// MOD task writes samples
+void write_to_ring_buffer(int16_t *samples, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        uint32_t next_pos = (mod_write_pos + 1) % MOD_BUFFER_SIZE;
+        if (next_pos == mod_read_pos) {
+            continue;  // Buffer full, skip sample
+        }
+        mod_ring_buffer[mod_write_pos] = samples[i];
+        mod_write_pos = next_pos;
+    }
+}
+
+// Audio task reads samples in mixing loop
+if (mod_read_pos != mod_write_pos) {
+    int16_t mod_sample = mod_ring_buffer[mod_read_pos];
+    float mod_sample_f = mod_sample / 32768.0f;
+    mix_left += mod_sample_f * 0.7f;   // 70% volume
+    mix_right += mod_sample_f * 0.7f;
+    mod_read_pos = (mod_read_pos + 1) % MOD_BUFFER_SIZE;
+}
+```
+
+### MOD Player Task
+
+**Key Requirements:**
+1. Separate FreeRTOS task with lower priority than audio task
+2. Generates mono samples at MOD native sample rate (22050 Hz)
+3. Writes to ring buffer (upsampled if needed)
+4. Handles tempo and pitch correctly
+
+**Sample Rate Considerations:**
+
+Amiga MOD files were designed for lower sample rates:
+- **Typical Amiga rate:** 8363-22050 Hz
+- **Modern I2S rate:** 44100 Hz
+
+**Critical lesson:** If MOD plays at wrong sample rate, both tempo AND pitch will be wrong!
+
+**Solution:** Play MOD at native 22050 Hz, then upsample to 44100 Hz:
+
+```c
+#define SAMPLE_RATE        22050  // MOD playback rate
+#define OUTPUT_RATE        44100  // I2S output rate
+
+static void write_to_ring_buffer(int16_t *samples, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int16_t scaled_sample = (int16_t)(samples[i] * 0.7f);  // Volume
+
+        // Write sample twice to upsample 22050 -> 44100 Hz
+        for (int j = 0; j < 2; j++) {
+            uint32_t next_pos = (mod_write_pos + 1) % MOD_BUFFER_SIZE;
+            if (next_pos == mod_read_pos) continue;
+            mod_ring_buffer[mod_write_pos] = scaled_sample;
+            mod_write_pos = next_pos;
+        }
+    }
+}
+```
+
+### MOD Tempo Calculation
+
+MOD files specify tempo in BPM and speed (ticks per row):
+- **Tempo:** BPM (default 125)
+- **Speed:** Ticks per row (default 6)
+
+**Critical formula for samples per tick:**
+
+```c
+// From original Amiga/PC MOD players
+samples_per_tick = (2500 * sample_rate) / (tempo * 1000);
+
+// Example at 125 BPM, 22050 Hz:
+samples_per_tick = (2500 * 22050) / (125 * 1000) = 441
+```
+
+**Implementation:**
+
+```c
+static int calculate_tick_samples(int tempo) {
+    return (2500 * SAMPLE_RATE) / (tempo * 1000);
+}
+
+// In playback loop
+int tempo = 125;  // Default or from MOD effect
+int samples_per_tick = calculate_tick_samples(tempo);
+
+// Generate correct number of samples
+process_tick(&mod, channels, buffer, samples_per_tick);
+write_to_ring_buffer(buffer, samples_per_tick);
+
+// Delay for the time it took to generate those samples
+int delay_ms = (samples_per_tick * 1000) / SAMPLE_RATE;
+if (delay_ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+}
+```
+
+### MOD Volume Issues
+
+8-bit MOD samples (-128 to 127) are inherently quieter than 16-bit:
+- **8-bit range:** ±128 = ±0.39% of 16-bit range
+- **16-bit range:** ±32768
+
+**Solution:** Apply gain during mixing:
+
+```c
+// Convert 8-bit MOD sample to 16-bit with gain
+int8_t sample_val = mod->samples[idx].data[pos];
+int16_t mixed = ((sample_val * volume) / 64) * 32;  // 32x gain
+
+// Then apply master volume when writing to ring buffer
+int16_t output = (int16_t)(mixed * MOD_VOLUME_SCALE);  // 0.7 for 70%
+```
+
+### Task Priority and Timing
+
+**Task setup:**
+
+```c
+// MOD player task (Core 1, lower priority)
+xTaskCreatePinnedToCore(
+    modplayer_task,
+    "modplayer",
+    8192,                           // Larger stack for MOD processing
+    NULL,
+    configMAX_PRIORITIES - 3,       // Lower than audio task
+    NULL,
+    1                               // Core 1
+);
+
+// Audio task (Core 1, higher priority)
+xTaskCreatePinnedToCore(
+    audio_task,
+    "audio",
+    4096,
+    NULL,
+    configMAX_PRIORITIES - 2,       // Higher priority
+    NULL,
+    1                               // Core 1
+);
+```
+
+**Why this matters:**
+- Audio task has higher priority → never starved
+- MOD task runs when audio task is blocked on I2S write
+- Both on Core 1 → leaves Core 0 for main application
+
+### Common MOD Integration Issues
+
+#### Issue 1: Clicking/Buzzing Instead of Music
+**Symptom:** Audio sounds like rapid clicking or buzzing.
+**Cause:** Task delay doesn't match actual sample generation time.
+**Example:** Generating 1024 samples (~23ms) but delay is only 1ms → ring buffer overflow.
+**Fix:** Match delay to actual samples generated:
+
+```c
+int samples_generated = 441;  // At 22050 Hz, 125 BPM
+int delay_ms = (samples_generated * 1000) / SAMPLE_RATE;  // ~20ms
+vTaskDelay(pdMS_TO_TICKS(delay_ms));
+```
+
+#### Issue 2: Music 2x Too Fast
+**Symptom:** Music plays at double speed, correct pitch.
+**Cause:** Generating wrong number of samples per tick.
+**Example:** Fixed 1024 samples instead of calculated 441 samples.
+**Fix:** Use tempo calculation formula (see above).
+
+#### Issue 3: Music Fast AND High Pitch
+**Symptom:** Both tempo and pitch are too high.
+**Cause:** Playing MOD at wrong sample rate (44100 Hz instead of 22050 Hz).
+**Fix:** Play MOD at native 22050 Hz, upsample to 44100 Hz (see above).
+
+#### Issue 4: Music Too Quiet
+**Symptom:** Background music barely audible compared to sound effects.
+**Cause:** Insufficient gain for 8-bit samples.
+**Fix:** Apply 32x gain during mixing, then volume scale at output.
+
+### Embedding MOD Files
+
+Convert MOD file to C header:
+
+```bash
+xxd -i popcorn_remix.mod > popcorn_remix_mod.h
+```
+
+**Result:**
+```c
+const unsigned char mod_data[] = {
+    0x70, 0x6f, 0x70, 0x63, 0x6f, 0x72, 0x6e, ...
+};
+const unsigned int mod_data_len = 61436;
+```
+
+**Load from embedded data:**
+
+```c
+MODFile mod;
+if (!load_mod_embedded(mod_data, mod_data_len, &mod)) {
+    ESP_LOGE(TAG, "Failed to load MOD");
+    return;
+}
+```
+
+### Memory Considerations
+
+**MOD file in flash:** ~60KB (read-only, no RAM cost)
+**Ring buffer:** 2048 samples × 2 bytes = 4KB RAM
+**MOD structures:** ~15KB RAM (patterns, channel state)
+**Total RAM:** ~19KB
+
+**Optimization:** Sample data points to flash, only patterns allocated in RAM.
+
+### Volume Balance Best Practices
+
+**Recommended mix:**
+- Background music: 70% (0.7f)
+- Sound effects: 10-30% (0.1f - 0.3f)
+- Master volume: 100%
+
+**Implementation:**
+
+```c
+// MOD player
+#define MOD_VOLUME_SCALE   0.7f
+output = (int16_t)(sample * MOD_VOLUME_SCALE);
+
+// Sound effects
+active_sounds[i].volume = 0.1f;
+
+// Audio mixing
+mix += mod_sample_f;              // 70%
+mix += sound_sample_f * volume;   // 10%
+
+// Soft clip
+mix = fminf(1.0f, fmaxf(-1.0f, mix));
+```
+
 ## Changelog
 
 - **2025-11-14:** Initial version based on tanmatsu-ballz implementation
+- **2025-11-15:** Added MOD music playback integration, ring buffer architecture, sample rate handling, tempo calculation, and common issues

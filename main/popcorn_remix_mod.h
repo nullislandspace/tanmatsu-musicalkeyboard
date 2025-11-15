@@ -1,6 +1,8 @@
 // Auto-generated from popcorn_remix.mod using xxd
 // Popcorn Remix by xain l.k (October 1990)
 // 4-channel Amiga MOD file
+//
+// Source: https://modarchive.org/index.php?request=view_by_moduleid&query=104811
 
 #ifndef POPCORN_REMIX_MOD_H
 #define POPCORN_REMIX_MOD_H

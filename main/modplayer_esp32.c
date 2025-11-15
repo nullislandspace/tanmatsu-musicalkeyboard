@@ -1,6 +1,10 @@
 // MOD Player for ESP32
 // Adapted from modplayer.c for I2S audio output via ring buffer
 // Plays 4-channel Amiga MOD files
+//
+// HEAVILY BASED ON CODE BY Tony Tascioglu
+// https://wiki.tonytascioglu.com/articles/playing_mod_tracker_music
+
 
 #include <stdio.h>
 #include <stdlib.h>
