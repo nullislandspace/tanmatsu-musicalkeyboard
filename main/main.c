@@ -28,6 +28,8 @@
 #include "modplayer_esp32.h"
 #include "logo_image.h"
 
+//#define CAVAC_DEBUG
+
 // Constants
 //static char const TAG[] = "main";
 
@@ -210,14 +212,24 @@ void app_main(void) {
     ESP_ERROR_CHECK(res);  // Check that the display parameters have been initialized
     bsp_display_rotation_t display_rotation = bsp_display_get_default_rotation();
 
+    char debugrotation[20] = "";
+    char debugcolor[20] = "";
+    char debugwidth[20] = "";
+    char debugheight[20] = "";
+
+    sprintf(debugwidth, "WIDTH: %d", display_h_res);
+    sprintf(debugheight, "HEIGHT: %d", display_v_res);
+
     // Convert ESP-IDF color format into PAX buffer type
     pax_buf_type_t format = PAX_BUF_24_888RGB;
     switch (display_color_format) {
         case LCD_COLOR_PIXEL_FORMAT_RGB565:
             format = PAX_BUF_16_565RGB;
+            sprintf(debugcolor, "Mode 565");
             break;
         case LCD_COLOR_PIXEL_FORMAT_RGB888:
             format = PAX_BUF_24_888RGB;
+            sprintf(debugcolor, "Mode 888");
             break;
         default:
             break;
@@ -228,16 +240,20 @@ void app_main(void) {
     switch (display_rotation) {
         case BSP_DISPLAY_ROTATION_90:
             orientation = PAX_O_ROT_CCW;
+            sprintf(debugrotation, "Rot: 90");
             break;
         case BSP_DISPLAY_ROTATION_180:
             orientation = PAX_O_ROT_HALF;
+            sprintf(debugrotation, "Rot: 180");
             break;
         case BSP_DISPLAY_ROTATION_270:
             orientation = PAX_O_ROT_CW;
+            sprintf(debugrotation, "Rot: 270");
             break;
         case BSP_DISPLAY_ROTATION_0:
         default:
             orientation = PAX_O_UPRIGHT;
+            sprintf(debugrotation, "Rot: 0");
             break;
     }
 
@@ -308,6 +324,13 @@ void app_main(void) {
         int fb_h = pax_buf_get_height(&fb);
         pax_draw_image_op(&fb, &logo_buf, (fb_w - LOGO_WIDTH) / 2, (fb_h - LOGO_HEIGHT) / 2);
         //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Press any key to exit the demo.");
+
+#ifdef CAVAC_DEBUG
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, debugrotation); // Tanmatsu: 270
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 20, debugcolor); // Tanmatsu: 565
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 40, debugwidth); // Tanmatsu: 480
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 60, debugheight); // Tanmatsu: 800
+#endif // CAVAC_DEBUG
 
         memset(led_data, 0, 18); // LEDS OFF
         led_data[(3 * 3) + 0] = 0xFF; // Power LED on
