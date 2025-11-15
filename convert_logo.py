@@ -8,7 +8,7 @@ from PIL import Image
 import sys
 
 # Input logo path
-LOGO_PATH = "/home/cavac/src/tanmatsu/tanmatsulogo.png"
+LOGO_PATH = "tanmatsulogo.png"
 
 # Output header path
 OUTPUT_PATH = "main/logo_image.h"
@@ -40,6 +40,10 @@ def main():
     else:
         new_width = original_width
         new_height = original_height
+
+    # Rotate 90 degrees clockwise for screen orientation
+    print("Rotating image 90° clockwise")
+    logo = logo.rotate(-90, expand=True)
 
     logo_width, logo_height = logo.size
 

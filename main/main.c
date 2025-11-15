@@ -255,9 +255,8 @@ void app_main(void) {
 #endif
     pax_buf_set_orientation(&fb, orientation);
 
-    // Initialize logo buffer with same orientation as framebuffer
+    // Initialize logo buffer (already pre-rotated in the image data)
     pax_buf_init(&logo_buf, (void*)logo_image_data, LOGO_WIDTH, LOGO_HEIGHT, PAX_BUF_16_565RGB);
-    pax_buf_set_orientation(&logo_buf, orientation);
 
 #if defined(CONFIG_BSP_TARGET_KAMI)
 #define BLACK 0
@@ -304,12 +303,10 @@ void app_main(void) {
         }
         // Draw black background
         pax_background(&fb, BLACK);
-        // Draw centered logo using actual hardware dimensions
-        // (logo is unrotated, fb coordinates account for rotation via pax_buf_get_*)
+        // Draw centered logo (logo is pre-rotated, fb is also rotated)
         int fb_w = pax_buf_get_width(&fb);
         int fb_h = pax_buf_get_height(&fb);
-        //pax_draw_image_op(&fb, &logo_buf, (fb_w - LOGO_WIDTH) / 2, (fb_h - LOGO_HEIGHT) / 2);
-        pax_draw_image_op(&fb, &logo_buf, 200, -100);
+        pax_draw_image_op(&fb, &logo_buf, (fb_w - LOGO_WIDTH) / 2, (fb_h - LOGO_HEIGHT) / 2);
         //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Press any key to exit the demo.");
 
         memset(led_data, 0, 18); // LEDS OFF
