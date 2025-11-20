@@ -53,7 +53,7 @@ typedef struct {
 // Global variables
 static size_t                       display_h_res        = 0;
 static size_t                       display_v_res        = 0;
-static lcd_color_rgb_pixel_format_t display_color_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
+static lcd_color_rgb_pixel_format_t display_color_format = LCD_COLOR_PIXEL_FORMAT_RGB888;
 static lcd_rgb_data_endian_t        display_data_endian  = LCD_RGB_DATA_ENDIAN_LITTLE;
 static pax_buf_t                    fb                   = {0};
 static pax_buf_t                    logo_buf             = {0};  // Logo image buffer
@@ -172,7 +172,7 @@ void app_main(void) {
     bsp_audio_initialize(SAMPLE_RATE);
     bsp_audio_get_i2s_handle(&i2s_handle);
     bsp_audio_set_amplifier(true);   // Enable amplifier
-    bsp_audio_set_volume(100);       // Set master volume to maximum
+    bsp_audio_set_volume(0);       // Set master volume to maximum
 
     // Initialize active sounds array
     memset(active_sounds, 0, sizeof(active_sounds));
@@ -222,14 +222,15 @@ void app_main(void) {
 
     // Convert ESP-IDF color format into PAX buffer type
     pax_buf_type_t format = PAX_BUF_24_888RGB;
+        sprintf(debugcolor, "Mode RGB888");
     switch (display_color_format) {
         case LCD_COLOR_PIXEL_FORMAT_RGB565:
             format = PAX_BUF_16_565RGB;
-            sprintf(debugcolor, "Mode 565");
+            sprintf(debugcolor, "Mode RGB565");
             break;
         case LCD_COLOR_PIXEL_FORMAT_RGB888:
             format = PAX_BUF_24_888RGB;
-            sprintf(debugcolor, "Mode 888");
+            sprintf(debugcolor, "Mode RGB888");
             break;
         default:
             break;
@@ -326,10 +327,10 @@ void app_main(void) {
         //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Press any key to exit the demo.");
 
 #ifdef CAVAC_DEBUG
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, debugrotation); // Tanmatsu: 270
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 20, debugcolor); // Tanmatsu: 565
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 40, debugwidth); // Tanmatsu: 480
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 60, debugheight); // Tanmatsu: 800
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 40, debugrotation); // Tanmatsu: 270
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 60, debugcolor); // Tanmatsu: 565
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 80, debugwidth); // Tanmatsu: 480
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 100, debugheight); // Tanmatsu: 800
 #endif // CAVAC_DEBUG
 
         memset(led_data, 0, 18); // LEDS OFF
