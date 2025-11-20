@@ -24,8 +24,8 @@
 #include "portmacro.h"
 #include "wifi_connection.h"
 #include "wifi_remote.h"
-#include "bounce_sounds.h"
-#include "modplayer_esp32.h"
+#include "keyboard_waveform.h"
+#include "keyboard_notes.h"
 #include "logo_image.h"
 
 //#define CAVAC_DEBUG
@@ -37,18 +37,29 @@
 extern void bsp_audio_initialize(uint32_t rate);
 
 // Audio constants
-#define MAX_ACTIVE_SOUNDS 5
+#define MAX_ACTIVE_NOTES  13    // 8 white keys + 5 black keys
 #define FRAMES_PER_WRITE  64
 #define SAMPLE_RATE       44100
 
-// Audio data structures
+// ADSR envelope states
+typedef enum {
+    ADSR_IDLE = 0,      // Note not playing
+    ADSR_ATTACK,        // Ramping up from 0% to 100%
+    ADSR_DECAY,         // Ramping down from 100% to sustain level
+    ADSR_SUSTAIN,       // Holding at sustain level while key pressed
+    ADSR_RELEASE        // Ramping down to 0% after key release
+} adsr_state_t;
+
+// Audio data structure for active notes
 typedef struct {
-    const int16_t* sample_data;    // Pointer to sound sample in flash
-    uint32_t sample_length;        // Total samples in sound
-    uint32_t playback_position;    // Current playback position
-    bool active;                   // Is this sound currently playing?
-    float volume;                  // Volume 0.0 to 1.0
-} active_sound_t;
+    int note_index;             // Which note (0-12), or -1 if inactive
+    float playback_position;    // Fractional sample position in waveform
+    float playback_speed;       // Speed multiplier (frequency / base_freq)
+    adsr_state_t adsr_state;    // Current ADSR envelope state
+    uint32_t adsr_timer;        // Sample counter for ADSR timing
+    float adsr_level;           // Current envelope level (0.0 to 1.0)
+    bool key_held;              // Is the key currently pressed?
+} active_note_t;
 
 // Global variables
 static size_t                       display_h_res        = 0;
@@ -61,13 +72,80 @@ static QueueHandle_t                input_event_queue    = NULL;
 
 // Audio global variables
 static i2s_chan_handle_t i2s_handle = NULL;
-static active_sound_t active_sounds[MAX_ACTIVE_SOUNDS];
-static volatile bool sound_trigger[5] = {false, false, false, false, false};
+static active_note_t active_notes[MAX_ACTIVE_NOTES];
+static bool note_keys_pressed[NUM_NOTES] = {false};  // Track which keys are currently pressed
+static float current_normalization = 1.0f;  // Smoothed normalization factor
+static uint8_t audio_volume = 100;  // Current volume (0-100%)
 
 #if defined(CONFIG_BSP_TARGET_KAMI)
 // Temporary addition for supporting epaper devices (irrelevant for Tanmatsu)
 static pax_col_t palette[] = {0xffffffff, 0xff000000, 0xffff0000};  // white, black, red
 #endif
+
+// Helper function: Get interpolated sample from waveform
+static inline float get_waveform_sample(float position) {
+    // Get integer and fractional parts
+    int pos_int = (int)position;
+    float pos_frac = position - pos_int;
+
+    // Wrap around the waveform cycle
+    pos_int = pos_int % WAVEFORM_CYCLE_LENGTH;
+    int next_pos = (pos_int + 1) % WAVEFORM_CYCLE_LENGTH;
+
+    // Linear interpolation
+    float sample1 = waveform_data[pos_int] / 32768.0f;
+    float sample2 = waveform_data[next_pos] / 32768.0f;
+    return sample1 + (sample2 - sample1) * pos_frac;
+}
+
+// Helper function: Update ADSR envelope for a note
+static inline void update_adsr(active_note_t* note) {
+    switch (note->adsr_state) {
+        case ADSR_IDLE:
+            note->adsr_level = 0.0f;
+            break;
+
+        case ADSR_ATTACK:
+            note->adsr_timer++;
+            note->adsr_level = (float)note->adsr_timer / ADSR_ATTACK_SAMPLES;
+            if (note->adsr_timer >= ADSR_ATTACK_SAMPLES) {
+                note->adsr_state = ADSR_DECAY;
+                note->adsr_timer = 0;
+                note->adsr_level = 1.0f;
+            }
+            break;
+
+        case ADSR_DECAY:
+            note->adsr_timer++;
+            float decay_progress = (float)note->adsr_timer / ADSR_DECAY_SAMPLES;
+            note->adsr_level = 1.0f - (1.0f - ADSR_SUSTAIN_LEVEL) * decay_progress;
+            if (note->adsr_timer >= ADSR_DECAY_SAMPLES) {
+                note->adsr_state = ADSR_SUSTAIN;
+                note->adsr_level = ADSR_SUSTAIN_LEVEL;
+            }
+            break;
+
+        case ADSR_SUSTAIN:
+            note->adsr_level = ADSR_SUSTAIN_LEVEL;
+            // Check if key was released
+            if (!note->key_held) {
+                note->adsr_state = ADSR_RELEASE;
+                note->adsr_timer = 0;
+            }
+            break;
+
+        case ADSR_RELEASE:
+            note->adsr_timer++;
+            float release_progress = (float)note->adsr_timer / ADSR_RELEASE_SAMPLES;
+            note->adsr_level = ADSR_SUSTAIN_LEVEL * (1.0f - release_progress);
+            if (note->adsr_timer >= ADSR_RELEASE_SAMPLES) {
+                note->adsr_state = ADSR_IDLE;
+                note->adsr_level = 0.0f;
+                note->note_index = -1;  // Mark slot as free
+            }
+            break;
+    }
+}
 
 // Audio mixing task
 void audio_task(void* arg) {
@@ -75,64 +153,61 @@ void audio_task(void* arg) {
     size_t bytes_written;
 
     while (1) {
-        // 1. Check for new sound triggers from main loop
-        for (int i = 0; i < 5; i++) {
-            if (sound_trigger[i]) {
-                // Find a free slot or reuse the slot for this sound
-                for (int slot = 0; slot < MAX_ACTIVE_SOUNDS; slot++) {
-                    if (!active_sounds[slot].active ||
-                        active_sounds[slot].sample_data == bounce_samples[i]) {
-                        active_sounds[slot].sample_data = bounce_samples[i];
-                        active_sounds[slot].sample_length = bounce_lengths[i];
-                        active_sounds[slot].playback_position = 0;
-                        active_sounds[slot].volume = 0.1f;  // 10% volume for ball sounds
-                        active_sounds[slot].active = true;
-                        break;
-                    }
-                }
-                sound_trigger[i] = false;  // Clear the trigger
-            }
-        }
-
-        // 2. Mix all active sounds into output buffer
+        // Mix all active notes into output buffer
         for (int frame = 0; frame < FRAMES_PER_WRITE; frame++) {
             float mix_left = 0.0f;
             float mix_right = 0.0f;
+            int active_count = 0;
 
-            // Add MOD background music (if available)
-            if (mod_read_pos != mod_write_pos) {
-                int16_t mod_sample = mod_ring_buffer[mod_read_pos];
-                float mod_sample_f = mod_sample / 32768.0f;
-                mix_left += mod_sample_f;
-                mix_right += mod_sample_f;
-                mod_read_pos = (mod_read_pos + 1) % MOD_BUFFER_SIZE;
-            }
+            // Process each active note
+            for (int i = 0; i < MAX_ACTIVE_NOTES; i++) {
+                if (active_notes[i].adsr_state != ADSR_IDLE) {
+                    active_count++;
 
-            // Accumulate all active sounds
-            for (int i = 0; i < MAX_ACTIVE_SOUNDS; i++) {
-                if (active_sounds[i].active) {
-                    // Get sample value
-                    int16_t sample = active_sounds[i].sample_data[
-                        active_sounds[i].playback_position
-                    ];
+                    // Get interpolated sample from waveform
+                    float sample = get_waveform_sample(active_notes[i].playback_position);
 
-                    // Convert to float (-1.0 to 1.0) and apply volume
-                    float sample_f = (sample / 32768.0f) * active_sounds[i].volume;
+                    // Update ADSR envelope
+                    update_adsr(&active_notes[i]);
+
+                    // Apply envelope
+                    sample *= active_notes[i].adsr_level;
 
                     // Accumulate (mono to stereo)
-                    mix_left += sample_f;
-                    mix_right += sample_f;
+                    mix_left += sample;
+                    mix_right += sample;
 
-                    // Advance playback position
-                    active_sounds[i].playback_position++;
-                    if (active_sounds[i].playback_position >=
-                        active_sounds[i].sample_length) {
-                        active_sounds[i].active = false;  // Sound finished
+                    // Advance playback position at the correct speed
+                    // Speed is independent per note - this ensures correct pitch
+                    active_notes[i].playback_position += active_notes[i].playback_speed;
+
+                    // Keep position within reasonable bounds to prevent overflow
+                    if (active_notes[i].playback_position >= WAVEFORM_CYCLE_LENGTH * 1000) {
+                        active_notes[i].playback_position -= WAVEFORM_CYCLE_LENGTH * 1000;
                     }
                 }
             }
 
-            // Soft clip to prevent distortion
+            // Normalize by number of active notes to prevent clipping
+            // This ensures total output stays within -1.0 to 1.0 range
+            if (active_count > 0) {
+                // Calculate target normalization (sqrt for better perceived loudness)
+                float target_normalization = 1.0f / sqrtf((float)active_count);
+
+                // Smooth the normalization change to prevent clicks when notes start/stop
+                // Use exponential smoothing: smaller alpha = smoother but slower response
+                // Alpha of 0.01 means normalization reaches 99% of target in ~460 samples (~10ms)
+                float alpha = 0.01f;
+                current_normalization += alpha * (target_normalization - current_normalization);
+
+                mix_left *= current_normalization;
+                mix_right *= current_normalization;
+            } else {
+                // No active notes, reset normalization to 1.0
+                current_normalization = 1.0f;
+            }
+
+            // Soft clip to prevent distortion (should rarely trigger now)
             mix_left = fminf(1.0f, fmaxf(-1.0f, mix_left));
             mix_right = fminf(1.0f, fmaxf(-1.0f, mix_right));
 
@@ -141,7 +216,9 @@ void audio_task(void* arg) {
             output_buffer[frame * 2 + 1] = (int16_t)(mix_right * 32767.0f);
         }
 
-        // 3. Write to I2S (blocks until DMA buffer is ready, ~1.45ms)
+        // Write to I2S (blocks until DMA buffer is ready, ~1.45ms)
+        // I2S output rate is constant at SAMPLE_RATE (44100 Hz)
+        // regardless of how many notes are playing
         if (i2s_handle != NULL) {
             i2s_channel_write(i2s_handle, output_buffer,
                             sizeof(output_buffer), &bytes_written, portMAX_DELAY);
@@ -151,6 +228,149 @@ void audio_task(void* arg) {
 
 void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
+}
+
+// Helper function: Start playing a note
+void start_note(int note_index) {
+    if (note_index < 0 || note_index >= NUM_NOTES) return;
+
+    // Find a free slot or reuse a slot with the same note
+    int slot = -1;
+    for (int i = 0; i < MAX_ACTIVE_NOTES; i++) {
+        if (active_notes[i].note_index == note_index) {
+            slot = i;  // Reuse existing slot for this note
+            break;
+        }
+        if (slot == -1 && active_notes[i].adsr_state == ADSR_IDLE) {
+            slot = i;  // Found a free slot
+        }
+    }
+
+    if (slot >= 0) {
+        // Start the note
+        active_notes[slot].note_index = note_index;
+        active_notes[slot].playback_position = 0.0f;
+        active_notes[slot].playback_speed = note_defs[note_index].frequency / WAVEFORM_BASE_FREQ;
+        active_notes[slot].adsr_state = ADSR_ATTACK;
+        active_notes[slot].adsr_timer = 0;
+        active_notes[slot].adsr_level = 0.0f;
+        active_notes[slot].key_held = true;
+    }
+}
+
+// Helper function: Stop playing a note
+void stop_note(int note_index) {
+    if (note_index < 0 || note_index >= NUM_NOTES) return;
+
+    // Find the active note and trigger release
+    for (int i = 0; i < MAX_ACTIVE_NOTES; i++) {
+        if (active_notes[i].note_index == note_index) {
+            active_notes[i].key_held = false;  // Trigger release phase
+        }
+    }
+}
+
+// Render on-screen keyboard
+void render_keyboard(pax_buf_t* fb, int width, int height) {
+    // Color constants (defined inline since they're used before main)
+    const pax_col_t COLOR_BLACK = 0xFF000000;
+    const pax_col_t COLOR_WHITE = 0xFFFFFFFF;
+    const pax_col_t COLOR_BLUE = 0xFF4444FF;
+    const pax_col_t COLOR_RED = 0xFFFF0000;
+    const pax_col_t COLOR_DARK_GREEN = 0xFF006400;  // Dark green for white keys
+    const pax_col_t COLOR_BRIGHT_GREEN = 0xFF00FF00;  // Bright green for black keys
+
+    // Keyboard dimensions (optimized for 480x800 display in landscape/portrait)
+    const int white_key_width = 60;
+    const int white_key_height = 200;
+    const int black_key_width = 40;
+    const int black_key_height = 130;
+    const int keyboard_start_y = height - white_key_height - 20;
+
+    // Keyboard key names for white keys (A, S, D, F, G, H, J, K)
+    const char* white_key_names[8] = {"A", "S", "D", "F", "G", "H", "J", "K"};
+
+    // Draw white keys (C, D, E, F, G, A, B, C)
+    for (int i = 0; i < 8; i++) {
+        int x = 10 + i * white_key_width;
+        int y = keyboard_start_y;
+
+        // Check if key is pressed
+        bool is_pressed = note_keys_pressed[i];
+        pax_col_t key_color = is_pressed ? COLOR_BLUE : COLOR_WHITE;  // Blue when pressed
+
+        // Draw key
+        pax_draw_rect(fb, key_color, x, y, white_key_width - 2, white_key_height);
+        pax_outline_rect(fb, COLOR_BLACK, x, y, white_key_width - 2, white_key_height);
+
+        // Draw keyboard key name in dark green (above note name)
+        pax_draw_text(fb, COLOR_DARK_GREEN, pax_font_sky_mono, 14, x + 21, y + white_key_height - 50, white_key_names[i]);
+
+        // Draw note name
+        pax_draw_text(fb, COLOR_BLACK, pax_font_sky_mono, 12, x + 18, y + white_key_height - 30, note_defs[i].name);
+    }
+
+    // Keyboard key names for black keys (Q, W, R, T, Y)
+    const char* black_key_names[5] = {"Q", "W", "R", "T", "Y"};
+
+    // Draw black keys (C#, D#, F#, G#, A#)
+    int black_key_map[5] = {8, 9, 10, 11, 12};  // Note indices for black keys
+    int black_key_x_offsets[5] = {
+        40,   // C# (between C and D)
+        100,  // D# (between D and E)
+        220,  // F# (between F and G)
+        280,  // G# (between G and A)
+        340   // A# (between A and B)
+    };
+
+    for (int i = 0; i < 5; i++) {
+        int x = 10 + black_key_x_offsets[i];
+        int y = keyboard_start_y;
+        int note_idx = black_key_map[i];
+
+        // Check if key is pressed
+        bool is_pressed = note_keys_pressed[note_idx];
+        pax_col_t key_color = is_pressed ? COLOR_RED : COLOR_BLACK;  // Red when pressed
+
+        // Draw key
+        pax_draw_rect(fb, key_color, x, y, black_key_width, black_key_height);
+        pax_outline_rect(fb, COLOR_WHITE, x, y, black_key_width, black_key_height);
+
+        // Draw keyboard key name in bright green (above note name)
+        pax_draw_text(fb, COLOR_BRIGHT_GREEN, pax_font_sky_mono, 12, x + 12, y + black_key_height - 40, black_key_names[i]);
+
+        // Draw note name
+        pax_draw_text(fb, COLOR_WHITE, pax_font_sky_mono, 10, x + 5, y + black_key_height - 20, note_defs[note_idx].name);
+    }
+}
+
+// Render volume indicator
+void render_volume_indicator(pax_buf_t* fb, int width, int height) {
+    const pax_col_t COLOR_WHITE = 0xFFFFFFFF;
+    const pax_col_t COLOR_DARK_GREEN = 0xFF006400;
+
+    // Volume bar dimensions
+    const int bar_width = 20;
+    const int bar_height = 100;
+    const int margin = 10;
+
+    // Position: bottom right corner, just a few pixels from bottom
+    int x = width - bar_width - margin;
+    int y = height - bar_height - margin;
+
+    // Draw hollow white rectangle (full volume range)
+    pax_outline_rect(fb, COLOR_WHITE, x, y, bar_width, bar_height);
+
+    // Calculate filled height based on volume (0-100%)
+    // Account for borders (2 pixels: top and bottom)
+    int max_fill_height = bar_height - 2;
+    int filled_height = (max_fill_height * audio_volume) / 100;
+
+    // Draw filled dark green bar from bottom up, staying inside the white border
+    if (filled_height > 0) {
+        int filled_y = y + bar_height - 1 - filled_height;  // -1 for bottom border
+        pax_draw_rect(fb, COLOR_DARK_GREEN, x + 1, filled_y, bar_width - 2, filled_height);
+    }
 }
 
 void app_main(void) {
@@ -172,13 +392,14 @@ void app_main(void) {
     bsp_audio_initialize(SAMPLE_RATE);
     bsp_audio_get_i2s_handle(&i2s_handle);
     bsp_audio_set_amplifier(true);   // Enable amplifier
-    bsp_audio_set_volume(0);       // Set master volume to maximum
+    bsp_audio_set_volume(audio_volume);  // Set initial volume (100%)
 
-    // Initialize active sounds array
-    memset(active_sounds, 0, sizeof(active_sounds));
-
-    // Initialize MOD player
-    modplayer_init();
+    // Initialize active notes array
+    memset(active_notes, 0, sizeof(active_notes));
+    for (int i = 0; i < MAX_ACTIVE_NOTES; i++) {
+        active_notes[i].note_index = -1;  // Mark all slots as free
+        active_notes[i].adsr_state = ADSR_IDLE;
+    }
 
     // Create audio mixing task on Core 1 with high priority
     xTaskCreatePinnedToCore(
@@ -187,17 +408,6 @@ void app_main(void) {
         4096,                           // Stack size
         NULL,                           // Parameters
         configMAX_PRIORITIES - 2,       // High priority
-        NULL,                           // Task handle
-        1                               // Pin to Core 1
-    );
-
-    // Create MOD player task on Core 1 with lower priority
-    xTaskCreatePinnedToCore(
-        modplayer_task,
-        "modplayer",
-        8192,                           // Stack size (larger for MOD processing)
-        NULL,                           // Parameters
-        configMAX_PRIORITIES - 3,       // Lower priority than audio task
         NULL,                           // Task handle
         1                               // Pin to Core 1
     );
@@ -222,7 +432,7 @@ void app_main(void) {
 
     // Convert ESP-IDF color format into PAX buffer type
     pax_buf_type_t format = PAX_BUF_24_888RGB;
-        sprintf(debugcolor, "Mode RGB888");
+    sprintf(debugcolor, "Mode RGB888");
     switch (display_color_format) {
         case LCD_COLOR_PIXEL_FORMAT_RGB565:
             format = PAX_BUF_16_565RGB;
@@ -273,7 +483,7 @@ void app_main(void) {
     pax_buf_set_orientation(&fb, orientation);
 
     // Initialize logo buffer (already pre-rotated in the image data)
-    pax_buf_init(&logo_buf, (void*)logo_image_data, LOGO_WIDTH, LOGO_HEIGHT, PAX_BUF_16_565RGB);
+    pax_buf_init(&logo_buf, (void*)logo_image_data, LOGO_WIDTH, LOGO_HEIGHT, PAX_BUF_24_888RGB);
 
 #if defined(CONFIG_BSP_TARGET_KAMI)
 #define BLACK 0
@@ -288,93 +498,118 @@ void app_main(void) {
     // Get input event queue from BSP
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
-    // Main section of the app
+    // Main section of the app - Musical Keyboard
 
-    // Bounce some balls around the screen
-    //
-    // On every bounce, light up one LED with the specific ball color, also blink the keyboard
+    // Get framebuffer dimensions
+    int fb_w = pax_buf_get_width(&fb);
+    int fb_h = pax_buf_get_height(&fb);
 
+    // Track whether screen needs updating
+    bool screen_needs_update = true;
+    uint32_t last_update_time = 0;
+    const uint32_t min_update_interval_ms = 33;  // Max 30 FPS to reduce DMA contention
 
-    // Setup data for the balls, "physics" and the corresponding LEDs
-    int32_t xoffs[5] = {100, 130, 170, 230, 335}; // Starting X position of balls
-    int32_t yoffs[5] = {100, 107, 209, 305, 227}; // Starting Y position of balls
-    int32_t xspeed[5] = {2, 1, -1, 3, -2}; // X speed (delta) of balls
-    int32_t yspeed[5] = {1, -1, 2, -2, 3}; // Y speed (delta) of balls
-    uint32_t color[5] = {0xFFFF0000, 0xFF00FF00, 0xFFFF00FF, 0xFF00FFFF, 0xFFFFFF00}; // Ball colors
-    bool bounce[5] = {false, false, false, false, false}; // Has bounced this render cycle
-
-    uint8_t led_offs[5] = {0 * 3, 1 * 3, 2 * 3, 4 * 3, 5 * 3};  // Starting offset in the led_data for the corresponding balls
-    uint8_t led_colormap[15] = {0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00}; // Color of the balls, split into bytes
-
-    // Bounce sound frequencies: 440, 554, 659, 784, 880 Hz (pentatonic scale)
-    // Sound samples are pre-generated and loaded from bounce_sounds.h
-
-    uint8_t i;
-    uint8_t ledoffs;
-    uint32_t delay = pdMS_TO_TICKS(1);  // 1ms timeout for responsive input
-    uint8_t bright = 100;
+    uint32_t delay = pdMS_TO_TICKS(10);  // 10ms timeout for input
     while(1) {
         bsp_input_event_t event;
-        if (xQueueReceive(input_event_queue, &event, delay) == pdTRUE) {
-            bsp_device_restart_to_launcher();
+        bool input_received = false;
+
+        // Process input events
+        while (xQueueReceive(input_event_queue, &event, 0) == pdTRUE) {
+            input_received = true;
+            if (event.type == INPUT_EVENT_TYPE_SCANCODE) {
+                uint32_t scancode = event.args_scancode.scancode;
+
+                // Remove release modifier to get actual key
+                uint32_t key = scancode & ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+
+                // Check if ESC key (0x01) is pressed
+                if (key == 0x01 && is_key_press(scancode)) {
+                    bsp_device_restart_to_launcher();
+                }
+
+                // Check for volume keys (only on key press)
+                if (is_key_press(scancode)) {
+                    bool volume_changed = false;
+
+                    // Volume down (dedicated volume down key)
+                    if (scancode == 0xE02E) {
+                        if (audio_volume >= 10) {
+                            audio_volume -= 10;
+                            volume_changed = true;
+                        }
+                    }
+                    // Volume up (dedicated volume up key)
+                    else if (scancode == 0xE030) {
+                        if (audio_volume <= 90) {
+                            audio_volume += 10;
+                            volume_changed = true;
+                        }
+                    }
+
+                    if (volume_changed) {
+                        bsp_audio_set_volume(audio_volume);
+                        screen_needs_update = true;  // Update screen to show new volume
+                    }
+                }
+
+                int note_idx = find_note_by_scancode(scancode);
+
+                if (note_idx >= 0) {
+                    if (is_key_press(scancode)) {
+                        // Key pressed - start note
+                        note_keys_pressed[note_idx] = true;
+                        start_note(note_idx);
+                        screen_needs_update = true;  // Update screen to show pressed key
+                    } else if (is_key_release(scancode)) {
+                        // Key released - stop note
+                        note_keys_pressed[note_idx] = false;
+                        stop_note(note_idx);
+                        screen_needs_update = true;  // Update screen to show released key
+                    }
+                }
+                // Ignore all other unmapped keys
+            }
         }
-        // Draw black background
-        pax_background(&fb, BLACK);
-        // Draw centered logo (logo is pre-rotated, fb is also rotated)
-        int fb_w = pax_buf_get_width(&fb);
-        int fb_h = pax_buf_get_height(&fb);
-        pax_draw_image_op(&fb, &logo_buf, (fb_w - LOGO_WIDTH) / 2, (fb_h - LOGO_HEIGHT) / 2);
-        //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Press any key to exit the demo.");
+
+        // Only update screen if needed and enough time has passed
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (screen_needs_update && (current_time - last_update_time >= min_update_interval_ms)) {
+            // Render display
+            pax_background(&fb, BLACK);
+
+            // Draw centered logo
+            pax_draw_image_op(&fb, &logo_buf, (fb_w - LOGO_WIDTH) / 2, 20);
+
+            // Draw title
+            //pax_draw_text(&fb, WHITE, pax_font_sky_mono, 18, 120, 160, "Musical Keyboard");
+
+            // Instructions
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 12, 60, 190, "Play notes using your keyboard");
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 12, 80, 210, "Press ESC to exit");
 
 #ifdef CAVAC_DEBUG
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 40, debugrotation); // Tanmatsu: 270
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 60, debugcolor); // Tanmatsu: 565
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 80, debugwidth); // Tanmatsu: 480
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 20, 100, debugheight); // Tanmatsu: 800
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 12, 20, 240, debugrotation);
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 12, 20, 260, debugcolor);
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 12, 20, 280, debugwidth);
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 12, 20, 300, debugheight);
 #endif // CAVAC_DEBUG
 
-        memset(led_data, 0, 18); // LEDS OFF
-        led_data[(3 * 3) + 0] = 0xFF; // Power LED on
-        led_data[(3 * 3) + 1] = 0xFF;
+            // Render keyboard
+            render_keyboard(&fb, fb_w, fb_h);
 
-        for(i = 0; i < 5; i++) {
-            bounce[i] = false;
-            xoffs[i] += xspeed[i];
-            if(xoffs[i] < 1 || xoffs[i] > (display_h_res - 50)) {
-                xspeed[i] *= -1;
-                xoffs[i] += xspeed[i];
-                bright = 100;
-                bounce[i] = true;
+            // Render volume indicator
+            render_volume_indicator(&fb, fb_w, fb_h);
 
-            }
-            yoffs[i] += yspeed[i];
-            if(yoffs[i] < 1 || yoffs[i] > (display_v_res - 50)) {
-                yspeed[i] *= -1;
-                yoffs[i] += yspeed[i];
-                bright = 100;
-                bounce[i] = true;
-            }
-            pax_draw_circle(&fb, color[i], yoffs[i] + 25, xoffs[i] + 25, 25);
-            if(bounce[i]) {
-                pax_draw_circle(&fb, BLACK, yoffs[i] + 25, xoffs[i] + 25, 15);
-                pax_draw_circle(&fb, WHITE, yoffs[i] + 25, xoffs[i] + 25, 10);
+            // Update display (DMA transfer to screen)
+            blit();
 
-                ledoffs = led_offs[i];
-
-                // Trigger bounce sound for this ball
-                sound_trigger[i] = true;
-
-                // For some strange reason, the LED array seems to expect G R B (instead of R G B), so we swap the bytes accordingly
-                led_data[ledoffs + 0] = led_colormap[(i * 3) + 1];
-                led_data[ledoffs + 1] = led_colormap[(i * 3) + 0];
-                led_data[ledoffs + 2] = led_colormap[(i * 3) + 2];
-            }
+            // Reset update flag and record time
+            screen_needs_update = false;
+            last_update_time = current_time;
         }
-        bsp_input_set_backlight_brightness(bright);
-        if(bright > 0) {
-            bright -= 25;
-        }
-        blit();
-        bsp_led_write(led_data, sizeof(led_data));
+
+        // Small delay to prevent busy-waiting and allow audio task to run
+        vTaskDelay(delay);
     }
 }

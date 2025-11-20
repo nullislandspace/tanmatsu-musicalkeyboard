@@ -7,7 +7,6 @@ endif()
 idf_component_register(
 	SRCS
 		"main.c"
-		"modplayer_esp32.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
