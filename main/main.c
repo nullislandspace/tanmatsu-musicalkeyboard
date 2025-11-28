@@ -386,7 +386,14 @@ void app_main(void) {
     ESP_ERROR_CHECK(res);
 
     // Initialize the Board Support Package
-    ESP_ERROR_CHECK(bsp_device_initialize());
+    const bsp_configuration_t bsp_configuration = {
+        .display =
+            {
+                .requested_color_format = display_color_format,
+                .num_fbs                = 1,
+            },
+    };
+    ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
 
     // Initialize audio subsystem
     bsp_audio_initialize(SAMPLE_RATE);
