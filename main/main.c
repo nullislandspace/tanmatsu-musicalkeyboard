@@ -385,7 +385,6 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(res);
 
-    // Initialize the Board Support Package
     const bsp_configuration_t bsp_configuration = {
         .display =
             {
@@ -393,6 +392,8 @@ void app_main(void) {
                 .num_fbs                = 1,
             },
     };
+
+    // Initialize the Board Support Package
     ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
 
     // Initialize audio subsystem
@@ -419,10 +420,9 @@ void app_main(void) {
         1                               // Pin to Core 1
     );
 
-    uint8_t led_data[] = {
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-    bsp_led_write(led_data, sizeof(led_data));
+    for (int i = 0; i < 6; i++) bsp_led_set_pixel(i, 0x000000);
+    bsp_led_send();
+    bsp_led_set_mode(false);
 
     // Get display parameters and rotation
     res = bsp_display_get_parameters(&display_h_res, &display_v_res, &display_color_format, &display_data_endian);
